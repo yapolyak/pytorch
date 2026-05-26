@@ -19,12 +19,15 @@
 #include <ws2tcpip.h>
 #else
 #include <arpa/inet.h>
+#include <c10/util/CallOnce.h>
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <atomic>
+#include <csignal>
 #endif
 
 #include <fmt/chrono.h>
@@ -91,6 +94,46 @@ inline void setSocketError(int val) noexcept {
   errno = val;
 }
 
+// Global atomic flag to track if a critical interrupt occurred
+std::atomic<bool> g_critical_interrupt_received{false};
+// Structs to cover for pre-existing signal handlers
+struct sigaction old_sigint_action;
+struct sigaction old_sigterm_action;
+// Flag to ensure handlers are registered once on-demand
+c10::once_flag signal_init_flag;
+
+// Custom handler for signals we want to interrupt the sleep.
+// We do not restore old handlers because SIGINT/SIGTERM are terminal
+// events; once they fire, the process is entering an irreversible shutdown.
+void c10d_signal_handler(int signum, siginfo_t* info, void* context) {
+  g_critical_interrupt_received.store(true, std::memory_order_relaxed);
+
+  // TODO: need to cover for more signal types?
+  struct sigaction* old_action =
+      (signum == SIGINT) ? &old_sigint_action : &old_sigterm_action;
+
+  if (old_action->sa_flags & SA_SIGINFO) {
+    if (old_action->sa_sigaction != nullptr) {
+      old_action->sa_sigaction(signum, info, context);
+    }
+  } else {
+    if (old_action->sa_handler != SIG_DFL &&
+        old_action->sa_handler != SIG_IGN) {
+      old_action->sa_handler(signum);
+    }
+  }
+}
+
+void register_c10d_signal_handlers() {
+  struct sigaction sa{};
+  sa.sa_sigaction = c10d_signal_handler;
+  sa.sa_flags = SA_SIGINFO | SA_RESTART;
+  sigemptyset(&sa.sa_mask);
+
+  sigaction(SIGINT, &sa, &old_sigint_action);
+  sigaction(SIGTERM, &sa, &old_sigterm_action);
+}
+
 #endif
 
 // Suspends the current thread for the specified duration.
@@ -98,19 +141,31 @@ void delay(std::chrono::milliseconds d) {
 #ifdef _WIN32
   std::this_thread::sleep_for(d);
 #else
+  c10::call_once(signal_init_flag, register_c10d_signal_handlers);
   ::timespec req{};
+  ::timespec rem{};
   auto ms = d.count();
   req.tv_sec = ms / 1000;
   req.tv_nsec = (ms % 1000) * 1000000;
 
   // The C++ Standard does not specify whether `sleep_for()` should be signal-
   // aware; therefore, we use the `nanosleep()` syscall.
-  if (::nanosleep(&req, nullptr) != 0) {
+  while (::nanosleep(&req, &rem) != 0) {
     std::error_code err = getSocketError();
     // We don't care about error conditions other than EINTR since a failure
     // here is not critical.
     if (err == std::errc::interrupted) {
-      C10_THROW_ERROR(DistNetworkError, c10::utils::str_error(err.value()));
+      // Check if the interrupt was caused by a critical signal (e.g., SIGINT)
+      if (g_critical_interrupt_received.load(std::memory_order_relaxed)) {
+        C10_THROW_ERROR(DistNetworkError, c10::utils::str_error(err.value()));
+      }
+      // If we reach here, it was a benign signal (like SIGPROF).
+      // Update the requested time to be the remaining time, and sleep again.
+      req = rem;
+    } else {
+      // If it failed for a reason other than an interrupt, break the loop and
+      // proceed
+      break;
     }
   }
 #endif
